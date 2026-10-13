@@ -94,7 +94,7 @@ async function run() {
                     });
                 }
 
-                // অবশ্যই response পাঠাতে হবে
+                // response
                 res.status(200).send({
                     success: true,
                     message: "Parcel deleted successfully",
