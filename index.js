@@ -160,6 +160,7 @@ async function run() {
             }
         });
 
+        // payment data post and get
         app.post("/create-payment-intent", async (req, res) => {
             try {
                 const { parcelId } = req.body;
@@ -402,7 +403,7 @@ async function run() {
                 });
             }
         });
-        
+
         app.get("/tracking/:trackingId", async (req, res) => {
             try {
                 const { trackingId } = req.params;
