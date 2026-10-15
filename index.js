@@ -2,6 +2,9 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const { initializeApp, cert } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+// const admin = require("firebase-admin");
 
 dotenv.config();
 const stripe = require('stripe')(process.env.PAYMENT_GATEWAY_KEY);
@@ -11,6 +14,16 @@ const PORT = process.env.PORT || 5000;
 // MIDDLEWARE
 app.use(cors());
 app.use(express.json());
+
+// const serviceAccount = require("./firebase-admin-key.json");
+// admin.initializeApp({
+//     credential: admin.credential.cert(serviceAccount)
+// });
+const serviceAccount = require("./firebase-admin-key.json");
+
+initializeApp({
+    credential: cert(serviceAccount),
+});
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.r67f24r.mongodb.net/?appName=Cluster0`;
 
@@ -29,13 +42,300 @@ async function run() {
         await client.connect();
 
         const db = client.db("zap_shift_user");
+        const usersCollection = db.collection('users');
         const parcelsCollection = db.collection("parcels");
         const paymentsCollection = db.collection("payments");
         const trackingCollection = db.collection("tracking");
+        const riderApplicationsCollection = db.collection("riderApplications");
 
-        app.get("/parcels", async (req, res) => {
+        // custom middlewares
+        const verifyFBToken = async (req, res, next) => {
+            const authHeader = req.headers.authorization;
+            if (!authHeader) {
+                return res.status(401).send({ message: 'unauthorized access' })
+            }
+            const token = authHeader.split(' ')[1];
+            if (!token) {
+                return res.status(401).send({ message: 'unauthorized access' })
+            }
+
+            // verify the token
+            try {
+                // const decoded = await admin.auth().verifyIdToken(token);
+                const decoded = await getAuth().verifyIdToken(token);
+                req.decoded = decoded;
+                next();
+            }
+            catch (error) {
+                return res.status(403).send({ message: 'forbidden access' })
+            }
+        }
+
+        // rider applications data
+        app.post("/riderApplications", verifyFBToken, async (req, res) => {
+            try {
+                const {
+                    age,
+                    region,
+                    district,
+                    phone,
+                    nid,
+                    bikeBrand,
+                    bikeRegistrationNumber,
+                    address,
+                    experience,
+                    emergencyContact,
+                } = req.body;
+
+                // Required-field validation
+                if (
+                    !age ||
+                    !region ||
+                    !district ||
+                    !phone ||
+                    !nid ||
+                    !bikeBrand ||
+                    !bikeRegistrationNumber ||
+                    !address ||
+                    !experience ||
+                    !emergencyContact
+                ) {
+                    return res.status(400).send({
+                        message: "Please provide all required information.",
+                    });
+                }
+
+                // Prevent duplicate applications from the same account
+                const existingApplication =
+                    await riderApplicationsCollection.findOne({
+                        uid: req.decoded.uid,
+                    });
+
+                // duplicate application handle
+
+                // if (existingApplication) {
+                //     return res.status(409).send({
+                //         message: "You have already submitted a rider application.",
+                //     });
+                // }
+
+                const riderApplication = {
+                    uid: req.decoded.uid,
+                    name: req.decoded.name || req.body.name || "",
+                    email: req.decoded.email,
+                    age,
+                    region,
+                    district,
+                    phone,
+                    nid,
+                    bikeBrand,
+                    bikeRegistrationNumber,
+                    address,
+                    experience,
+                    emergencyContact,
+                    status: "pending",
+                    appliedAt: new Date(),
+                };
+
+                const result = await riderApplicationsCollection.insertOne(
+                    riderApplication
+                );
+
+                res.status(201).send({
+                    success: true,
+                    message: "Rider application submitted successfully.",
+                    insertedId: result.insertedId,
+                });
+            } catch (error) {
+                console.error("Rider application error:", error);
+
+                res.status(500).send({
+                    message: "Failed to submit rider application.",
+                });
+            }
+        });
+
+        // GET: Pending Rider Applications
+        app.get("/riderApplications/pending", async (req, res) => {
+            try {
+                const result = await riderApplicationsCollection
+                    .find({ status: "pending" })
+                    .sort({ appliedAt: -1 })
+                    .toArray();
+
+                res.send(result);
+            } catch (error) {
+                console.error("Error fetching pending riders:", error);
+                res.status(500).send({
+                    message: "Failed to fetch pending rider applications",
+                });
+            }
+        });
+
+        app.get("/riderApplications", verifyFBToken, async (req, res) => {
+            try {
+                const { status } = req.query;
+
+                if (status !== "active") {
+                    return res.status(400).send({
+                        message: "Invalid status",
+                    });
+                }
+
+                const activeRiders = await riderApplicationsCollection
+                    .find({ status: "active" })
+                    .sort({ appliedAt: -1 })
+                    .toArray();
+
+                res.status(200).send(activeRiders);
+            } catch (error) {
+                console.error("Fetch active riders error:", error);
+
+                res.status(500).send({
+                    message: "Failed to fetch active riders",
+                });
+            }
+        }
+        );
+
+        // app.patch("/rider-applications/:id/status", verifyFBToken, async (req, res) => {
+        //     try {
+        //         const { id } = req.params;
+        //         const { status } = req.body;
+
+        //         // Validate MongoDB ObjectId
+        //         if (!ObjectId.isValid(id)) {
+        //             return res.status(400).send({
+        //                 message: "Invalid rider application ID",
+        //             });
+        //         }
+
+        //         // Only allow these status values
+        //         if (!["active", "rejected"].includes(status)) {
+        //             return res.status(400).send({
+        //                 message: "Invalid status. Use active or rejected.",
+        //             });
+        //         }
+
+        //         const result = await riderApplicationsCollection.updateOne(
+        //             {
+        //                 _id: new ObjectId(id),
+        //                 status: "pending",
+        //             },
+        //             {
+        //                 $set: {
+        //                     status,
+        //                     reviewedAt: new Date(),
+        //                 },
+        //             }
+        //         );
+
+        //         if (result.matchedCount === 0) {
+        //             return res.status(404).send({
+        //                 message:
+        //                     "Application not found or it has already been reviewed.",
+        //             });
+        //         }
+
+        //         res.send({
+        //             success: true,
+        //             message:
+        //                 status === "active"
+        //                     ? "Rider application approved successfully."
+        //                     : "Rider application rejected successfully.",
+        //         });
+        //     } catch (error) {
+        //         console.error("Update rider status error:", error);
+
+        //         res.status(500).send({
+        //             message: "Failed to update rider application status.",
+        //         });
+        //     }
+        // }
+        // );
+
+
+        app.patch("/riderApplications/:id/status", verifyFBToken, async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { status } = req.body;
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({
+                        message: "Invalid rider ID",
+                    });
+                }
+
+                if (!["active", "inactive", "rejected"].includes(status)) {
+                    return res.status(400).send({
+                        message: "Invalid status",
+                    });
+                }
+
+                const currentStatus =
+                    status === "inactive" ? "active" : "pending";
+
+                const result = await riderApplicationsCollection.updateOne(
+                    {
+                        _id: new ObjectId(id),
+                        status: currentStatus,
+                    },
+                    {
+                        $set: {
+                            status,
+                            reviewedAt: new Date(),
+                        },
+                    }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).send({
+                        message: "Rider not found or status has already changed",
+                    });
+                }
+
+                res.send({
+                    success: true,
+                    message: `Rider status updated to ${status}`,
+                });
+            } catch (error) {
+                console.error("Update rider status error:", error);
+
+                res.status(500).send({
+                    message: "Failed to update rider status",
+                });
+            }
+        }
+        );
+
+        // app.get("/riderApplications/active", async (req, res) => {
+        //     const result = await riderApplicationsCollection.find({ status: "approved" }).toArray();
+        //     res.send(result);
+        // })
+
+        // user collection
+
+        app.post('/users', async (req, res) => {
+            const email = req.body.email;
+            const userExists = await usersCollection.findOne({ email })
+            if (userExists) {
+                // update last log in
+                return res.status(200).send({ message: 'User already exists', inserted: false });
+            }
+            const user = req.body;
+            const result = await usersCollection.insertOne(user);
+            res.send(result);
+        })
+
+        app.get("/parcels", verifyFBToken, async (req, res) => {
+            // console.log('header in payments', req.headers);
+
             try {
                 const email = req.query.email;
+                console.log('decoded ', req.decoded);
+                if (req.decoded.email !== email) {
+                    return res.status(403).send({ message: 'forbidden access' })
+                }
 
                 const query = email
                     ? { createdByEmail: email }
@@ -455,12 +755,10 @@ async function run() {
     }
 }
 run().catch(console.dir);
-
 // simple ROUTE
 app.get("/", (req, res) => {
     res.send("ZapShift Server is Running!");
 });
-
 // START SERVER
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
