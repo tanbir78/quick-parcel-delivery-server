@@ -64,12 +64,140 @@ async function run() {
                 // const decoded = await admin.auth().verifyIdToken(token);
                 const decoded = await getAuth().verifyIdToken(token);
                 req.decoded = decoded;
+
+                // console.log("Decoded name:", req.decoded.name);
+                // console.log("Decoded email:", req.decoded.email);
                 next();
             }
             catch (error) {
                 return res.status(403).send({ message: 'forbidden access' })
             }
         }
+
+        // user role api
+        app.get("/users/role", verifyFBToken, async (req, res) => {
+            try {
+                const email = req.query.email?.trim().toLowerCase();
+
+                if (!email) {
+                    return res.status(400).send({
+                        message: "Email is required",
+                    });
+                }
+
+                // Token email && requested email
+                if (req.decoded.email?.toLowerCase() !== email) {
+                    return res.status(403).send({
+                        message: "Forbidden access",
+                    });
+                }
+
+                const user = await usersCollection.findOne(
+                    { email },
+                    { projection: { role: 1, _id: 0 } }
+                );
+
+                if (!user) {
+                    return res.status(404).send({
+                        message: "User not found",
+                    });
+                }
+
+                res.send({ role: user.role || "user" });
+            } catch (error) {
+                console.error("Get user role error:", error);
+
+                res.status(500).send({
+                    message: "Failed to get user role",
+                });
+            }
+        });
+
+        // for admin
+        app.get("/users/search", async (req, res) => {
+            try {
+                const email = req.query.email?.trim();
+
+                // if (!email || email.length < 3) {
+                //     return res.status(400).send({
+                //         message: "Enter at least 3 characters to search.",
+                //     });
+                // }
+
+                const users = await usersCollection
+                    .find(
+                        { email: { $regex: email, $options: "i" } },
+                        {
+                            projection: {
+                                email: 1,
+                                created_at: 1,
+                                role: 1,
+                            },
+                        }
+                    )
+                    .limit(10)
+                    .toArray();
+
+                res.send(users);
+            } catch (error) {
+                console.error("User search error:", error);
+                res.status(500).send({ message: "Failed to search users." });
+            }
+        });
+
+        app.patch("/users/:id/role", verifyFBToken, async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { role } = req.body;
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({
+                        message: "Invalid user ID.",
+                    });
+                }
+
+                if (!["admin", "user"].includes(role)) {
+                    return res.status(400).send({
+                        message: "Invalid role.",
+                    });
+                }
+
+                // Prevent an admin from removing their own admin role.
+                const targetUser = await usersCollection.findOne({
+                    _id: new ObjectId(id),
+                });
+
+                if (!targetUser) {
+                    return res.status(404).send({
+                        message: "User not found.",
+                    });
+                }
+
+                if (
+                    targetUser.uid === req.decoded.uid &&
+                    role === "user"
+                ) {
+                    return res.status(403).send({
+                        message: "You cannot remove your own admin role.",
+                    });
+                }
+
+                const result = await usersCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { role } }
+                );
+
+                res.send({
+                    success: true,
+                    message: `User role updated to ${role}.`,
+                });
+            } catch (error) {
+                console.error("Update user role error:", error);
+                res.status(500).send({
+                    message: "Failed to update user role.",
+                });
+            }
+        });
 
         // rider applications data
         app.post("/riderApplications", verifyFBToken, async (req, res) => {
@@ -156,7 +284,7 @@ async function run() {
         });
 
         // GET: Pending Rider Applications
-        app.get("/riderApplications/pending", async (req, res) => {
+        app.get("/riderApplications/pending", verifyFBToken, async (req, res) => {
             try {
                 const result = await riderApplicationsCollection
                     .find({ status: "pending" })
@@ -258,20 +386,18 @@ async function run() {
         app.patch("/riderApplications/:id/status", verifyFBToken, async (req, res) => {
             try {
                 const { id } = req.params;
-                const { status } = req.body;
+                const { status, email } = req.body;
 
                 if (!ObjectId.isValid(id)) {
                     return res.status(400).send({
                         message: "Invalid rider ID",
                     });
                 }
-
                 if (!["active", "inactive", "rejected"].includes(status)) {
                     return res.status(400).send({
                         message: "Invalid status",
                     });
                 }
-
                 const currentStatus =
                     status === "inactive" ? "active" : "pending";
 
@@ -287,6 +413,18 @@ async function run() {
                         },
                     }
                 );
+
+                //update user role for accepting rider
+                if (status === 'active') {
+                    const userQuery = { email };
+                    const userUpdateDoc = {
+                        $set: {
+                            role: 'rider'
+                        }
+                    };
+                    const roleResult = await usersCollection.updateOne(userQuery, userUpdateDoc)
+                    console.log(roleResult.modifiedCount);
+                }
 
                 if (result.matchedCount === 0) {
                     return res.status(404).send({
@@ -327,7 +465,7 @@ async function run() {
             res.send(result);
         })
 
-        app.get("/parcels", verifyFBToken, async (req, res) => {
+        app.get("/parcels", async (req, res) => {
             // console.log('header in payments', req.headers);
 
             try {
