@@ -74,6 +74,268 @@ async function run() {
             }
         }
 
+        const verifyAdmin = async (req, res, next) => {
+            const email = req.decoded.email;
+            const query = { email }
+            const user = await usersCollection.findOne(query);
+            if (!user || user.role !== 'admin') {
+                return res.status(403).send({ message: 'forbidden access' })
+            }
+            next();
+        }
+
+        // assign riders
+        app.get(
+            "/parcels/assign-rider",
+            verifyFBToken,
+            verifyAdmin,
+            async (req, res) => {
+                try {
+                    const parcels = await parcelsCollection
+                        .find({
+                            status: "pending",
+                            paymentStatus: "paid",
+                        })
+                        .sort({ creation_date: -1 })
+                        .toArray();
+
+                    res.send(parcels);
+                } catch (error) {
+                    console.error("Error fetching parcels for rider assignment:", error);
+
+                    res.status(500).send({
+                        message: "Failed to fetch parcels for rider assignment.",
+                    });
+                }
+            }
+        );
+
+        app.get(
+            "/riders/available",
+            verifyFBToken,
+            verifyAdmin,
+            async (req, res) => {
+                try {
+                    const district = req.query.district?.trim();
+
+                    if (!district) {
+                        return res.status(400).send({
+                            message: "District is required.",
+                        });
+                    }
+
+                    const escapedDistrict = district.replace(
+                        /[.*+?^${}()|[\]\\]/g,
+                        "\\$&"
+                    );
+
+                    const riders = await riderApplicationsCollection
+                        .find(
+                            {
+                                district: {
+                                    $regex: `^${escapedDistrict}$`,
+                                    $options: "i",
+                                },
+                                status: "active",
+                            },
+                            {
+                                projection: {
+                                    name: 1,
+                                    email: 1,
+                                    phone: 1,
+                                    district: 1,
+                                    region: 1,
+                                    bikeBrand: 1,
+                                    bikeRegistrationNumber: 1,
+                                },
+                            }
+                        )
+                        .toArray();
+
+                    res.send(riders);
+                } catch (error) {
+                    console.error("Error fetching riders:", error);
+
+                    res.status(500).send({
+                        message: "Failed to fetch riders.",
+                    });
+                }
+            }
+        );
+
+        app.patch(
+            "/parcels/:parcelId/assign-rider",
+            verifyFBToken,
+            verifyAdmin,
+            async (req, res) => {
+                try {
+                    const { parcelId } = req.params;
+                    const { riderId } = req.body;
+
+                    if (
+                        !ObjectId.isValid(parcelId) ||
+                        !ObjectId.isValid(riderId)
+                    ) {
+                        return res.status(400).send({
+                            message: "Invalid parcel or rider ID.",
+                        });
+                    }
+
+                    const parcelObjectId = new ObjectId(parcelId);
+                    const riderObjectId = new ObjectId(riderId);
+
+                    // Find parcel
+                    const parcel = await parcelsCollection.findOne({
+                        _id: parcelObjectId,
+                    });
+
+                    if (!parcel) {
+                        return res.status(404).send({
+                            message: "Parcel not found.",
+                        });
+                    }
+
+                    if (
+                        parcel.status !== "pending" ||
+                        parcel.paymentStatus !== "paid"
+                    ) {
+                        return res.status(400).send({
+                            message: "This parcel cannot be assigned.",
+                        });
+                    }
+
+                    // Find active rider
+                    const rider = await riderApplicationsCollection.findOne({
+                        _id: riderObjectId,
+                        status: "active",
+                    });
+
+                    if (!rider) {
+                        return res.status(404).send({
+                            message: "Active rider not found.",
+                        });
+                    }
+
+                    if (rider.workStatus === "in delivery") {
+                        return res.status(409).send({
+                            message: "This rider is already delivering a parcel.",
+                        });
+                    }
+
+                    // Match rider district with parcel service center
+                    if (
+                        rider.district?.trim().toLowerCase() !==
+                        parcel.receiverServiceCenter?.trim().toLowerCase()
+                    ) {
+                        return res.status(400).send({
+                            message: "Rider district does not match the parcel service center.",
+                        });
+                    }
+
+                    // Update parcel
+                    const parcelUpdate = await parcelsCollection.updateOne(
+                        {
+                            _id: parcelObjectId,
+                            status: "pending",
+                            paymentStatus: "paid",
+                        },
+                        {
+                            $set: {
+                                delivery_status: "in-transit",
+                                assignedRiderId: riderObjectId,
+                                assignedRiderName: rider.name || "",
+                                assignedRiderEmail: rider.email,
+                                assignedAt: new Date().toISOString(),
+                            },
+                        }
+                    );
+
+                    if (parcelUpdate.modifiedCount !== 1) {
+                        return res.status(409).send({
+                            message: "Parcel was already assigned or its status changed.",
+                        });
+                    }
+
+                    // Update rider work status
+                    try {
+                        const riderUpdate = await riderApplicationsCollection.updateOne(
+                            {
+                                _id: riderObjectId,
+                                status: "active",
+                                workStatus: { $ne: "in delivery" },
+                            },
+                            {
+                                $set: {
+                                    workStatus: "in delivery",
+                                },
+                            }
+                        );
+
+                        if (riderUpdate.modifiedCount !== 1) {
+                            // Roll back parcel assignment if rider update fails
+                            await parcelsCollection.updateOne(
+                                {
+                                    _id: parcelObjectId,
+                                    assignedRiderId: riderObjectId,
+                                },
+                                {
+                                    $set: {
+                                        delivery_status: parcel.delivery_status || "pending",
+                                    },
+                                    $unset: {
+                                        assignedRiderId: "",
+                                        assignedRiderName: "",
+                                        assignedRiderEmail: "",
+                                        assignedAt: "",
+                                    },
+                                }
+                            );
+
+                            return res.status(409).send({
+                                message: "Rider is no longer available. Please select another rider.",
+                            });
+                        }
+                    } catch (error) {
+                        // Roll back parcel assignment if rider update throws
+                        await parcelsCollection.updateOne(
+                            {
+                                _id: parcelObjectId,
+                                assignedRiderId: riderObjectId,
+                            },
+                            {
+                                $set: {
+                                    delivery_status: parcel.delivery_status || "pending",
+                                },
+                                $unset: {
+                                    assignedRiderId: "",
+                                    assignedRiderName: "",
+                                    assignedRiderEmail: "",
+                                    assignedAt: "",
+                                },
+                            }
+                        );
+
+                        throw error;
+                    }
+
+                    res.send({
+                        success: true,
+                        message: "Rider assigned successfully.",
+                        parcelId,
+                        riderId,
+                        delivery_status: "in-transit",
+                        workStatus: "in delivery",
+                    });
+                } catch (error) {
+                    console.error("Assign rider error:", error);
+
+                    res.status(500).send({
+                        message: "Failed to assign rider.",
+                    });
+                }
+            }
+        );
+
         // user role api
         app.get("/users/role", verifyFBToken, async (req, res) => {
             try {
@@ -145,7 +407,7 @@ async function run() {
             }
         });
 
-        app.patch("/users/:id/role", verifyFBToken, async (req, res) => {
+        app.patch("/users/:id/role", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
                 const { role } = req.body;
@@ -284,7 +546,7 @@ async function run() {
         });
 
         // GET: Pending Rider Applications
-        app.get("/riderApplications/pending", verifyFBToken, async (req, res) => {
+        app.get("/riderApplications/pending", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const result = await riderApplicationsCollection
                     .find({ status: "pending" })
@@ -326,64 +588,7 @@ async function run() {
         }
         );
 
-        // app.patch("/rider-applications/:id/status", verifyFBToken, async (req, res) => {
-        //     try {
-        //         const { id } = req.params;
-        //         const { status } = req.body;
-
-        //         // Validate MongoDB ObjectId
-        //         if (!ObjectId.isValid(id)) {
-        //             return res.status(400).send({
-        //                 message: "Invalid rider application ID",
-        //             });
-        //         }
-
-        //         // Only allow these status values
-        //         if (!["active", "rejected"].includes(status)) {
-        //             return res.status(400).send({
-        //                 message: "Invalid status. Use active or rejected.",
-        //             });
-        //         }
-
-        //         const result = await riderApplicationsCollection.updateOne(
-        //             {
-        //                 _id: new ObjectId(id),
-        //                 status: "pending",
-        //             },
-        //             {
-        //                 $set: {
-        //                     status,
-        //                     reviewedAt: new Date(),
-        //                 },
-        //             }
-        //         );
-
-        //         if (result.matchedCount === 0) {
-        //             return res.status(404).send({
-        //                 message:
-        //                     "Application not found or it has already been reviewed.",
-        //             });
-        //         }
-
-        //         res.send({
-        //             success: true,
-        //             message:
-        //                 status === "active"
-        //                     ? "Rider application approved successfully."
-        //                     : "Rider application rejected successfully.",
-        //         });
-        //     } catch (error) {
-        //         console.error("Update rider status error:", error);
-
-        //         res.status(500).send({
-        //             message: "Failed to update rider application status.",
-        //         });
-        //     }
-        // }
-        // );
-
-
-        app.patch("/riderApplications/:id/status", verifyFBToken, async (req, res) => {
+        app.patch("/riderApplications/:id/status", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
                 const { status, email } = req.body;
@@ -465,22 +670,61 @@ async function run() {
             res.send(result);
         })
 
-        app.get("/parcels", async (req, res) => {
-            // console.log('header in payments', req.headers);
+        // app.get("/parcels", async (req, res) => {
+        //     // console.log('header in payments', req.headers);
 
+        //     try {
+        //         const email = req.query.email;
+        //         console.log('decoded ', req.decoded);
+        //         if (req.decoded.email !== email) {
+        //             return res.status(403).send({ message: 'forbidden access' })
+        //         }
+
+        //         const query = email
+        //             ? { createdByEmail: email }
+        //             : {};
+
+        //         const parcels = await parcelsCollection
+        //             .find(query)
+        //             .sort({ createdAt: -1 })
+        //             .toArray();
+
+        //         res.send({
+        //             success: true,
+        //             data: parcels,
+        //         });
+        //     } catch (error) {
+        //         console.error("Error fetching parcels:", error);
+
+        //         res.status(500).send({
+        //             success: false,
+        //             message: "Failed to fetch parcels",
+        //         });
+        //     }
+        // });
+
+        app.get("/parcels", verifyFBToken, async (req, res) => {
             try {
-                const email = req.query.email;
-                console.log('decoded ', req.decoded);
-                if (req.decoded.email !== email) {
-                    return res.status(403).send({ message: 'forbidden access' })
+                const email = req.query.email?.trim();
+
+                if (!email) {
+                    return res.status(400).send({
+                        success: false,
+                        message: "Email is required",
+                    });
                 }
 
-                const query = email
-                    ? { createdByEmail: email }
-                    : {};
+                console.log("Decoded email:", req.decoded.email);
+
+                if (req.decoded.email?.toLowerCase() !== email.toLowerCase()) {
+                    return res.status(403).send({
+                        success: false,
+                        message: "Forbidden access",
+                    });
+                }
 
                 const parcels = await parcelsCollection
-                    .find(query)
+                    .find({ createdByEmail: email })
                     .sort({ createdAt: -1 })
                     .toArray();
 
@@ -498,7 +742,7 @@ async function run() {
             }
         });
 
-        //POST 
+        //POST
         app.post("/parcels", async (req, res) => {
             try {
                 const parcel = req.body;
@@ -530,6 +774,7 @@ async function run() {
                 });
             }
         });
+
 
         // GET: Get a single parcel by ID
         app.get('/parcels/:id', async (req, res) => {
