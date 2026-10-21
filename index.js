@@ -93,6 +93,50 @@ async function run() {
             next();
         }
 
+        //
+        app.get("/admin/delivery-status-count", verifyFBToken, verifyAdmin, async (req, res) => {
+            try {
+                const result = await parcelsCollection
+                    .aggregate([
+                        {
+                            $set: {
+                                delivery_status: {
+                                    $ifNull: ["$delivery_status", "pending"],
+                                },
+                            },
+                        },
+                        {
+                            $group: {
+                                _id: "$delivery_status",
+                                count: { $sum: 1 },
+                            },
+                        },
+                        {
+                            $project: {
+                                _id: 0,
+                                status: "$_id",
+                                count: 1,
+                            },
+                        },
+                        {
+                            $sort: { count: -1 },
+                        },
+                    ])
+                    .toArray();
+
+                res.send(result);
+            } catch (error) {
+                console.error("Delivery status count error:", error);
+
+                res.status(500).send({
+                    success: false,
+                    message: "Failed to fetch delivery status counts",
+                });
+            }
+        }
+        );
+
+
         // Tracking event helper
         const createTrackingEvent = async ({
             parcel,
