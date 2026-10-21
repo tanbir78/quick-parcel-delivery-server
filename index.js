@@ -114,6 +114,60 @@ async function run() {
         };
 
         // Public parcel tracking API
+        // app.get("/tracking/:trackingId", async (req, res) => {
+        //     try {
+        //         const { trackingId } = req.params;
+
+        //         const parcel = await parcelsCollection.findOne(
+        //             { trackingId },
+        //             {
+        //                 projection: {
+        //                     trackingId: 1,
+        //                     parcelTitle: 1,
+        //                     parcelType: 1,
+        //                     senderRegion: 1,
+        //                     receiverRegion: 1,
+        //                     senderServiceCenter: 1,
+        //                     receiverServiceCenter: 1,
+        //                     status: 1,
+        //                     paymentStatus: 1,
+        //                     delivery_status: 1,
+        //                     submittedAt: 1,
+        //                     paidAt: 1,
+        //                     assignedAt: 1,
+        //                     pickedUpAt: 1,
+        //                     deliveredAt: 1,
+        //                 },
+        //             }
+        //         );
+
+        //         if (!parcel) {
+        //             return res.status(404).send({
+        //                 success: false,
+        //                 message: "Parcel not found",
+        //             });
+        //         }
+
+        //         const trackingHistory = await trackingCollection
+        //             .find({ trackingId, isPublic: true })
+        //             .sort({ createdAt: 1 })
+        //             .toArray();
+
+        //         res.send({
+        //             success: true,
+        //             parcel,
+        //             trackingHistory,
+        //         });
+        //     } catch (error) {
+        //         console.error("Tracking API error:", error);
+
+        //         res.status(500).send({
+        //             success: false,
+        //             message: error.message,
+        //         });
+        //     }
+        // });
+
         app.get("/tracking/:trackingId", async (req, res) => {
             try {
                 const { trackingId } = req.params;
@@ -149,7 +203,22 @@ async function run() {
                 }
 
                 const trackingHistory = await trackingCollection
-                    .find({ trackingId, isPublic: true })
+                    .find(
+                        { trackingId, isPublic: true },
+                        {
+                            projection: {
+                                trackingId: 1,
+                                status: 1,
+                                title: 1,
+                                description: 1,
+                                createdAt: 1,
+                                location: 1,
+                                riderName: 1,
+                                riderEmail: 1,
+                                riderPhone: 1,
+                            },
+                        }
+                    )
                     .sort({ createdAt: 1 })
                     .toArray();
 
@@ -159,10 +228,78 @@ async function run() {
                     trackingHistory,
                 });
             } catch (error) {
-                console.error(error);
+                console.error("Tracking API error:", error);
+
                 res.status(500).send({
                     success: false,
-                    message: "Failed to track parcel",
+                    message: "Failed to retrieve tracking information.",
+                });
+            }
+        });
+
+        app.post("/tracking", verifyFBToken, async (req, res) => {
+            try {
+                const {
+                    parcelId,
+                    trackingId,
+                    status,
+                    title,
+                    description,
+                } = req.body;
+
+                if (
+                    !parcelId ||
+                    !ObjectId.isValid(parcelId) ||
+                    !trackingId ||
+                    !status ||
+                    !title ||
+                    !description
+                ) {
+                    return res.status(400).send({
+                        success: false,
+                        message: "Missing or invalid tracking information",
+                    });
+                }
+
+                const parcel = await parcelsCollection.findOne({
+                    _id: new ObjectId(parcelId),
+                    trackingId,
+                });
+
+                if (!parcel) {
+                    return res.status(404).send({
+                        success: false,
+                        message: "Parcel not found",
+                    });
+                }
+
+                const result = await trackingCollection.insertOne({
+                    parcelId: parcel._id,
+                    trackingId: parcel.trackingId,
+                    status,
+                    title,
+                    description,
+
+                    riderName: req.body.riderName || "",
+                    riderEmail: req.body.riderEmail || "",
+                    riderPhone: req.body.riderPhone || "",
+                    location: req.body.location || "",
+
+                    actorRole: "system",
+                    createdAt: new Date(),
+                    isPublic: true,
+                });
+
+                res.send({
+                    success: true,
+                    insertedId: result.insertedId,
+                });
+            } catch (error) {
+                console.error("POST /tracking error:", error);
+
+                res.status(500).send({
+                    success: false,
+                    message: error.message,
                 });
             }
         });
@@ -830,7 +967,10 @@ async function run() {
                 });
             }
         }
+
         );
+
+
         app.patch("/rider/delivery-tasks/:parcelId/status", verifyFBToken, verifyRider, async (req, res) => {
             try {
                 const { parcelId } = req.params;
@@ -1878,108 +2018,108 @@ async function run() {
         });
 
         //tracking
-        app.post("/tracking", async (req, res) => {
-            try {
-                const { trackingId, status, note, location } = req.body;
+        // app.post("/tracking", async (req, res) => {
+        //     try {
+        //         const { trackingId, status, note, location } = req.body;
 
-                const allowedStatuses = [
-                    "pending",
-                    "picked_up",
-                    "in_transit",
-                    "arrived_at_hub",
-                    "out_for_delivery",
-                    "delivered",
-                    "returned",
-                ];
+        //         const allowedStatuses = [
+        //             "pending",
+        //             "picked_up",
+        //             "in_transit",
+        //             "arrived_at_hub",
+        //             "out_for_delivery",
+        //             "delivered",
+        //             "returned",
+        //         ];
 
-                if (
-                    !trackingId ||
-                    !status ||
-                    !note ||
-                    !allowedStatuses.includes(status)
-                ) {
-                    return res.status(400).send({
-                        success: false,
-                        message: "Invalid tracking information",
-                    });
-                }
+        //         if (
+        //             !trackingId ||
+        //             !status ||
+        //             !note ||
+        //             !allowedStatuses.includes(status)
+        //         ) {
+        //             return res.status(400).send({
+        //                 success: false,
+        //                 message: "Invalid tracking information",
+        //             });
+        //         }
 
-                const parcel = await parcelsCollection.findOne({ trackingId });
+        //         const parcel = await parcelsCollection.findOne({ trackingId });
 
-                if (!parcel) {
-                    return res.status(404).send({
-                        success: false,
-                        message: "Parcel not found",
-                    });
-                }
+        //         if (!parcel) {
+        //             return res.status(404).send({
+        //                 success: false,
+        //                 message: "Parcel not found",
+        //             });
+        //         }
 
-                const trackingEvent = {
-                    parcelId: parcel._id,
-                    trackingId: parcel.trackingId,
-                    status,
-                    note,
-                    location: location || "",
-                    timestamp: new Date(),
-                };
+        //         const trackingEvent = {
+        //             parcelId: parcel._id,
+        //             trackingId: parcel.trackingId,
+        //             status,
+        //             note,
+        //             location: location || "",
+        //             timestamp: new Date(),
+        //         };
 
-                const result = await trackingCollection.insertOne(trackingEvent);
+        //         const result = await trackingCollection.insertOne(trackingEvent);
 
-                res.status(201).send({
-                    success: true,
-                    message: "Tracking updated successfully",
-                    insertedId: result.insertedId,
-                });
-            } catch (error) {
-                console.error("Tracking update error:", error);
+        //         res.status(201).send({
+        //             success: true,
+        //             message: "Tracking updated successfully",
+        //             insertedId: result.insertedId,
+        //         });
+        //     } catch (error) {
+        //         console.error("Tracking update error:", error);
 
-                res.status(500).send({
-                    success: false,
-                    message: "Failed to update tracking",
-                });
-            }
-        });
+        //         res.status(500).send({
+        //             success: false,
+        //             message: "Failed to update tracking",
+        //         });
+        //     }
+        // });
 
-        app.get("/tracking/:trackingId", async (req, res) => {
-            try {
-                const { trackingId } = req.params;
+        // app.get("/tracking/:trackingId", async (req, res) => {
+        //     try {
+        //         const { trackingId } = req.params;
 
-                const parcel = await parcelsCollection.findOne({ trackingId });
+        //         const parcel = await parcelsCollection.findOne({ trackingId });
 
-                if (!parcel) {
-                    return res.status(404).send({
-                        success: false,
-                        message: "Parcel not found",
-                    });
-                }
+        //         if (!parcel) {
+        //             return res.status(404).send({
+        //                 success: false,
+        //                 message: "Parcel not found",
+        //             });
+        //         }
 
-                const trackingUpdates = await trackingCollection
-                    .find({ trackingId })
-                    .sort({ timestamp: -1 })
-                    .toArray();
+        //         const trackingUpdates = await trackingCollection
+        //             .find({ trackingId })
+        //             .sort({ timestamp: -1 })
+        //             .toArray();
 
-                res.send({
-                    success: true,
-                    data: {
-                        parcel: {
-                            trackingId: parcel.trackingId,
-                            parcelTitle: parcel.parcelTitle,
-                            senderRegion: parcel.senderRegion,
-                            receiverRegion: parcel.receiverRegion,
-                            createdAt: parcel.createdAt,
-                            status: trackingUpdates[0]?.status || "pending",
-                        },
-                        trackingUpdates,
-                    },
-                });
-            } catch (error) {
-                console.error("Get tracking error:", error);
+        //         res.send({
+        //             success: true,
+        //             data: {
+        //                 parcel: {
+        //                     trackingId: parcel.trackingId,
+        //                     parcelTitle: parcel.parcelTitle,
+        //                     senderRegion: parcel.senderRegion,
+        //                     receiverRegion: parcel.receiverRegion,
+        //                     createdAt: parcel.createdAt,
+        //                     status: trackingUpdates[0]?.status || "pending",
+        //                 },
+        //                 trackingUpdates,
+        //             },
+        //         });
+        //     } catch (error) {
+        //         console.error("Get tracking error:", error);
 
-                res.status(500).send({
-                    success: false,
-                    message: "Failed to get tracking history",
-                });
-            }
-        });
+        //         res.status(500).send({
+        //             success: false,
+        //             message: "Failed to get tracking history",
+        //         });
+        //     }
+        // });
 
         // Send a ping to confirm a successful connection
         await client.db("admin").command({ ping: 1 });
