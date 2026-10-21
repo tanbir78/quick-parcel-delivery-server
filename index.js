@@ -15,10 +15,6 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// const serviceAccount = require("./firebase-admin-key.json");
-// admin.initializeApp({
-//     credential: admin.credential.cert(serviceAccount)
-// });
 const serviceAccount = require("./firebase-admin-key.json");
 
 initializeApp({
@@ -74,6 +70,7 @@ async function run() {
                 return res.status(403).send({ message: 'forbidden access' })
             }
         }
+
         const verifyAdmin = async (req, res, next) => {
             const email = req.decoded.email;
             const query = { email }
@@ -83,6 +80,7 @@ async function run() {
             }
             next();
         }
+
         const verifyRider = async (req, res, next) => {
             const email = req.decoded.email;
             const query = { email }
@@ -92,6 +90,74 @@ async function run() {
             }
             next();
         }
+
+        // Update logged-in user's profile
+        app.patch("/users/profile", verifyFBToken, async (req, res) => {
+            try {
+                const email = req.decoded.email;
+
+                if (!email) {
+                    return res.status(401).send({
+                        success: false,
+                        message: "Unauthorized user",
+                    });
+                }
+
+                const {
+                    name,
+                    photoURL,
+                    phone,
+                    region,
+                    district,
+                    address,
+                } = req.body;
+
+                // Validate input
+                if (!name || name.trim().length < 2) {
+                    return res.status(400).send({
+                        success: false,
+                        message: "Name must contain at least 2 characters",
+                    });
+                }
+
+                const profileData = {
+                    name: name.trim(),
+                    photoURL: photoURL?.trim() || "",
+                    phone: phone?.trim() || "",
+                    region: region || "",
+                    district: district || "",
+                    address: address?.trim() || "",
+                    updatedAt: new Date().toISOString(),
+                };
+
+                const result = await usersCollection.updateOne(
+                    { email },
+                    {
+                        $set: profileData,
+                        $setOnInsert: {
+                            email,
+                            role: "user",
+                            created_at: new Date().toISOString(),
+                        },
+                    },
+                    { upsert: true }
+                );
+
+                res.send({
+                    success: true,
+                    message: "Profile updated successfully",
+                    modifiedCount: result.modifiedCount,
+                    upsertedId: result.upsertedId,
+                });
+            } catch (error) {
+                console.error("Update profile error:", error);
+
+                res.status(500).send({
+                    success: false,
+                    message: "Failed to update profile",
+                });
+            }
+        });
 
         //
         app.get("/admin/delivery-status-count", verifyFBToken, verifyAdmin, async (req, res) => {
@@ -136,7 +202,6 @@ async function run() {
         }
         );
 
-
         // Tracking event helper
         const createTrackingEvent = async ({
             parcel,
@@ -157,60 +222,6 @@ async function run() {
             });
         };
 
-        // Public parcel tracking API
-        // app.get("/tracking/:trackingId", async (req, res) => {
-        //     try {
-        //         const { trackingId } = req.params;
-
-        //         const parcel = await parcelsCollection.findOne(
-        //             { trackingId },
-        //             {
-        //                 projection: {
-        //                     trackingId: 1,
-        //                     parcelTitle: 1,
-        //                     parcelType: 1,
-        //                     senderRegion: 1,
-        //                     receiverRegion: 1,
-        //                     senderServiceCenter: 1,
-        //                     receiverServiceCenter: 1,
-        //                     status: 1,
-        //                     paymentStatus: 1,
-        //                     delivery_status: 1,
-        //                     submittedAt: 1,
-        //                     paidAt: 1,
-        //                     assignedAt: 1,
-        //                     pickedUpAt: 1,
-        //                     deliveredAt: 1,
-        //                 },
-        //             }
-        //         );
-
-        //         if (!parcel) {
-        //             return res.status(404).send({
-        //                 success: false,
-        //                 message: "Parcel not found",
-        //             });
-        //         }
-
-        //         const trackingHistory = await trackingCollection
-        //             .find({ trackingId, isPublic: true })
-        //             .sort({ createdAt: 1 })
-        //             .toArray();
-
-        //         res.send({
-        //             success: true,
-        //             parcel,
-        //             trackingHistory,
-        //         });
-        //     } catch (error) {
-        //         console.error("Tracking API error:", error);
-
-        //         res.status(500).send({
-        //             success: false,
-        //             message: error.message,
-        //         });
-        //     }
-        // });
 
         app.get("/tracking/:trackingId", async (req, res) => {
             try {
@@ -1156,6 +1167,7 @@ async function run() {
                 }
             }
         );
+
         app.get(
             "/riders/available",
             verifyFBToken,
@@ -1208,6 +1220,7 @@ async function run() {
                 }
             }
         );
+
         app.patch("/parcels/:parcelId/assign-rider", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { parcelId } = req.params;
@@ -1415,6 +1428,7 @@ async function run() {
                 });
             }
         });
+
         // for admin
         app.get("/users/search", async (req, res) => {
             try {
@@ -1446,6 +1460,7 @@ async function run() {
                 res.status(500).send({ message: "Failed to search users." });
             }
         });
+
         app.patch("/users/:id/role", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
@@ -1583,6 +1598,7 @@ async function run() {
                 });
             }
         });
+
         // GET: Pending Rider Applications
         app.get("/riderApplications/pending", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
@@ -1599,6 +1615,7 @@ async function run() {
                 });
             }
         });
+
         app.get("/riderApplications", verifyFBToken, async (req, res) => {
             try {
                 const { status } = req.query;
@@ -1624,6 +1641,7 @@ async function run() {
             }
         }
         );
+
         app.patch("/riderApplications/:id/status", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
@@ -1687,13 +1705,6 @@ async function run() {
         }
         );
 
-        // app.get("/riderApplications/active", async (req, res) => {
-        //     const result = await riderApplicationsCollection.find({ status: "approved" }).toArray();
-        //     res.send(result);
-        // })
-
-        // user collection
-
         app.post('/users', async (req, res) => {
             const email = req.body.email;
             const userExists = await usersCollection.findOne({ email })
@@ -1705,40 +1716,7 @@ async function run() {
             const result = await usersCollection.insertOne(user);
             res.send(result);
         })
-
-        // app.get("/parcels", async (req, res) => {
-        //     // console.log('header in payments', req.headers);
-
-        //     try {
-        //         const email = req.query.email;
-        //         console.log('decoded ', req.decoded);
-        //         if (req.decoded.email !== email) {
-        //             return res.status(403).send({ message: 'forbidden access' })
-        //         }
-
-        //         const query = email
-        //             ? { createdByEmail: email }
-        //             : {};
-
-        //         const parcels = await parcelsCollection
-        //             .find(query)
-        //             .sort({ createdAt: -1 })
-        //             .toArray();
-
-        //         res.send({
-        //             success: true,
-        //             data: parcels,
-        //         });
-        //     } catch (error) {
-        //         console.error("Error fetching parcels:", error);
-
-        //         res.status(500).send({
-        //             success: false,
-        //             message: "Failed to fetch parcels",
-        //         });
-        //     }
-        // });
-
+        
         app.get("/parcels", verifyFBToken, async (req, res) => {
             try {
                 const email = req.query.email?.trim();
@@ -1777,6 +1755,23 @@ async function run() {
                 });
             }
         });
+
+        app.get("/parcels/my-parcels", verifyFBToken, async (req, res) => {
+    try {
+        const email = req.decoded.email;
+
+        const parcels = await parcelsCollection
+            .find({ createdByEmail: email })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        res.send(parcels);
+    } catch (error) {
+        res.status(500).send({
+            message: "Failed to fetch your parcels",
+        });
+    }
+});
 
         //POST
         app.post("/parcels", async (req, res) => {
@@ -2060,110 +2055,6 @@ async function run() {
                 });
             }
         });
-
-        //tracking
-        // app.post("/tracking", async (req, res) => {
-        //     try {
-        //         const { trackingId, status, note, location } = req.body;
-
-        //         const allowedStatuses = [
-        //             "pending",
-        //             "picked_up",
-        //             "in_transit",
-        //             "arrived_at_hub",
-        //             "out_for_delivery",
-        //             "delivered",
-        //             "returned",
-        //         ];
-
-        //         if (
-        //             !trackingId ||
-        //             !status ||
-        //             !note ||
-        //             !allowedStatuses.includes(status)
-        //         ) {
-        //             return res.status(400).send({
-        //                 success: false,
-        //                 message: "Invalid tracking information",
-        //             });
-        //         }
-
-        //         const parcel = await parcelsCollection.findOne({ trackingId });
-
-        //         if (!parcel) {
-        //             return res.status(404).send({
-        //                 success: false,
-        //                 message: "Parcel not found",
-        //             });
-        //         }
-
-        //         const trackingEvent = {
-        //             parcelId: parcel._id,
-        //             trackingId: parcel.trackingId,
-        //             status,
-        //             note,
-        //             location: location || "",
-        //             timestamp: new Date(),
-        //         };
-
-        //         const result = await trackingCollection.insertOne(trackingEvent);
-
-        //         res.status(201).send({
-        //             success: true,
-        //             message: "Tracking updated successfully",
-        //             insertedId: result.insertedId,
-        //         });
-        //     } catch (error) {
-        //         console.error("Tracking update error:", error);
-
-        //         res.status(500).send({
-        //             success: false,
-        //             message: "Failed to update tracking",
-        //         });
-        //     }
-        // });
-
-        // app.get("/tracking/:trackingId", async (req, res) => {
-        //     try {
-        //         const { trackingId } = req.params;
-
-        //         const parcel = await parcelsCollection.findOne({ trackingId });
-
-        //         if (!parcel) {
-        //             return res.status(404).send({
-        //                 success: false,
-        //                 message: "Parcel not found",
-        //             });
-        //         }
-
-        //         const trackingUpdates = await trackingCollection
-        //             .find({ trackingId })
-        //             .sort({ timestamp: -1 })
-        //             .toArray();
-
-        //         res.send({
-        //             success: true,
-        //             data: {
-        //                 parcel: {
-        //                     trackingId: parcel.trackingId,
-        //                     parcelTitle: parcel.parcelTitle,
-        //                     senderRegion: parcel.senderRegion,
-        //                     receiverRegion: parcel.receiverRegion,
-        //                     createdAt: parcel.createdAt,
-        //                     status: trackingUpdates[0]?.status || "pending",
-        //                 },
-        //                 trackingUpdates,
-        //             },
-        //         });
-        //     } catch (error) {
-        //         console.error("Get tracking error:", error);
-
-        //         res.status(500).send({
-        //             success: false,
-        //             message: "Failed to get tracking history",
-        //         });
-        //     }
-        // });
 
         // Send a ping to confirm a successful connection
         await client.db("admin").command({ ping: 1 });
