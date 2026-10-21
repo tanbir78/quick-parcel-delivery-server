@@ -91,6 +91,166 @@ async function run() {
             next();
         }
 
+        // rider status update
+        app.patch("/rider/delivery-tasks/:parcelId/status", verifyFBToken, async (req, res) => {
+            try {
+                const { parcelId } = req.params;
+                const { action } = req.body;
+                const riderEmail = req.decoded.email;
+
+                if (!ObjectId.isValid(parcelId)) {
+                    return res.status(400).send({
+                        message: "Invalid parcel ID",
+                    });
+                }
+
+                if (!["picked-up", "delivered"].includes(action)) {
+                    return res.status(400).send({
+                        message: "Invalid action",
+                    });
+                }
+
+                const parcelObjectId = new ObjectId(parcelId);
+
+                // Find parcel assigned to the logged-in rider.
+                const parcel = await parcelsCollection.findOne({
+                    _id: parcelObjectId,
+                    assignedRiderEmail: riderEmail,
+                });
+
+                if (!parcel) {
+                    return res.status(404).send({
+                        message:
+                            "Assigned parcel not found. Check assignedRiderEmail.",
+                    });
+                }
+
+                const currentStatus = (
+                    parcel.delivery_status || parcel.status || "pending"
+                ).toLowerCase();
+
+                // Rider picks up parcel.
+                if (action === "picked-up") {
+                    if (
+                        !["assigned", "pending", "pending-pickup"].includes(
+                            currentStatus
+                        )
+                    ) {
+                        return res.status(400).send({
+                            message: "Parcel is not pending pickup",
+                        });
+                    }
+
+                    await parcelsCollection.updateOne(
+                        {
+                            _id: parcelObjectId,
+                            assignedRiderEmail: riderEmail,
+                        },
+                        {
+                            $set: {
+                                delivery_status: "in-transit",
+                                status: "in-transit",
+                                pickedUpAt: new Date(),
+                                updatedAt: new Date(),
+                            },
+                        }
+                    );
+
+                    await riderApplicationsCollection.updateOne(
+                        {
+                            email: riderEmail,
+                            status: "active",
+                        },
+                        {
+                            $set: {
+                                workStatus: "in delivery",
+                            },
+                        }
+                    );
+
+                    return res.send({
+                        success: true,
+                        message: "Parcel picked up successfully",
+                    });
+                }
+
+                // Rider delivers parcel.
+                if (currentStatus !== "in-transit") {
+                    return res.status(400).send({
+                        message: "Parcel must be in transit before delivery",
+                    });
+                }
+
+                const updateResult = await parcelsCollection.updateOne(
+                    {
+                        _id: parcelObjectId,
+                        assignedRiderEmail: riderEmail,
+                        delivery_status: "in-transit",
+                    },
+                    {
+                        $set: {
+                            status: "delivered",
+                            delivery_status: "delivered",
+                            deliveredAt: new Date(),
+                            updatedAt: new Date(),
+                        },
+                    }
+                );
+
+                if (updateResult.modifiedCount === 0) {
+                    return res.status(409).send({
+                        message: "Parcel status already changed",
+                    });
+                }
+
+                // Check whether this rider has any active parcels left.
+                const activeParcelCount =
+                    await parcelsCollection.countDocuments({
+                        assignedRiderEmail: riderEmail,
+                        delivery_status: {
+                            $in: [
+                                "assigned",
+                                "pending",
+                                "pending-pickup",
+                                "in-transit",
+                            ],
+                        },
+                    });
+
+                // Set rider available only if no active parcels remain.
+                if (activeParcelCount === 0) {
+                    await riderApplicationsCollection.updateOne(
+                        {
+                            email: riderEmail,
+                            status: "active",
+                        },
+                        {
+                            $set: {
+                                workStatus: "available",
+                            },
+                        }
+                    );
+                }
+
+                return res.send({
+                    success: true,
+                    message: "Parcel delivered successfully",
+                    riderWorkStatus:
+                        activeParcelCount === 0
+                            ? "available"
+                            : "in delivery",
+                });
+            } catch (error) {
+                console.error("Delivery status error:", error);
+
+                return res.status(500).send({
+                    message: "Failed to update delivery status",
+                });
+            }
+        }
+        );
+
+
         // Update logged-in user's profile
         app.patch("/users/profile", verifyFBToken, async (req, res) => {
             try {
@@ -1025,124 +1185,6 @@ async function run() {
 
         );
 
-
-        app.patch("/rider/delivery-tasks/:parcelId/status", verifyFBToken, verifyRider, async (req, res) => {
-            try {
-                const { parcelId } = req.params;
-                const { action } = req.body;
-                const riderEmail = req.decoded.email;
-
-                if (!ObjectId.isValid(parcelId)) {
-                    return res.status(400).send({
-                        message: "Invalid parcel ID.",
-                    });
-                }
-
-                if (!["picked-up", "delivered"].includes(action)) {
-                    return res.status(400).send({
-                        message: "Invalid delivery action.",
-                    });
-                }
-
-                const parcelObjectId = new ObjectId(parcelId);
-
-                const parcel = await parcelsCollection.findOne({
-                    _id: parcelObjectId,
-                    assignedRiderEmail: riderEmail,
-                });
-
-                if (!parcel) {
-                    return res.status(404).send({
-                        message: "Assigned parcel not found.",
-                    });
-                }
-
-                const currentStatus = (
-                    parcel.delivery_status || ""
-                ).toLowerCase();
-
-                let allowedStatuses;
-                let newStatus;
-                let newDeliveryStatus;
-
-                if (action === "picked-up") {
-                    allowedStatuses = ["assigned", "pending-pickup"];
-                    newStatus = "in transit";
-                    newDeliveryStatus = "in-transit";
-                } else {
-                    allowedStatuses = ["in-transit"];
-                    newStatus = "delivered";
-                    newDeliveryStatus = "delivered";
-                }
-
-                if (!allowedStatuses.includes(currentStatus)) {
-                    return res.status(409).send({
-                        message:
-                            action === "picked-up"
-                                ? "This parcel cannot be picked up in its current status."
-                                : "Only in-transit parcels can be marked as delivered.",
-                    });
-                }
-
-                const now = new Date().toISOString();
-
-                const updateFields = {
-                    status: newStatus,
-                    delivery_status: newDeliveryStatus,
-                    updatedAt: now,
-                };
-
-                if (action === "picked-up") {
-                    updateFields.pickedUpAt = now;
-                } else {
-                    updateFields.deliveredAt = now;
-                }
-
-                const result = await parcelsCollection.updateOne(
-                    {
-                        _id: parcelObjectId,
-                        assignedRiderEmail: riderEmail,
-                        delivery_status: parcel.delivery_status,
-                    },
-                    {
-                        $set: updateFields,
-                        $push: {
-                            trackingHistory: {
-                                status: newDeliveryStatus,
-                                updatedAt: now,
-                                updatedBy: riderEmail,
-                            },
-                        },
-                    }
-                );
-
-                if (result.modifiedCount !== 1) {
-                    return res.status(409).send({
-                        message:
-                            "Parcel status changed. Refresh and try again.",
-                    });
-                }
-
-                res.send({
-                    success: true,
-                    message:
-                        action === "picked-up"
-                            ? "Parcel marked as picked up."
-                            : "Parcel marked as delivered.",
-                    status: newStatus,
-                    delivery_status: newDeliveryStatus,
-                });
-            } catch (error) {
-                console.error("Update delivery status error:", error);
-
-                res.status(500).send({
-                    message: "Failed to update delivery status.",
-                });
-            }
-        }
-        );
-
-        // assign riders
         app.get(
             "/parcels/assign-rider",
             verifyFBToken,
@@ -1716,7 +1758,7 @@ async function run() {
             const result = await usersCollection.insertOne(user);
             res.send(result);
         })
-        
+
         app.get("/parcels", verifyFBToken, async (req, res) => {
             try {
                 const email = req.query.email?.trim();
@@ -1757,21 +1799,21 @@ async function run() {
         });
 
         app.get("/parcels/my-parcels", verifyFBToken, async (req, res) => {
-    try {
-        const email = req.decoded.email;
+            try {
+                const email = req.decoded.email;
 
-        const parcels = await parcelsCollection
-            .find({ createdByEmail: email })
-            .sort({ createdAt: -1 })
-            .toArray();
+                const parcels = await parcelsCollection
+                    .find({ createdByEmail: email })
+                    .sort({ createdAt: -1 })
+                    .toArray();
 
-        res.send(parcels);
-    } catch (error) {
-        res.status(500).send({
-            message: "Failed to fetch your parcels",
+                res.send(parcels);
+            } catch (error) {
+                res.status(500).send({
+                    message: "Failed to fetch your parcels",
+                });
+            }
         });
-    }
-});
 
         //POST
         app.post("/parcels", async (req, res) => {
