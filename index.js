@@ -47,6 +47,7 @@ async function run() {
         const paymentsCollection = db.collection("payments");
         const trackingCollection = db.collection("tracking");
         const riderApplicationsCollection = db.collection("riderApplications");
+        const cashoutsCollection = db.collection("cashouts");
 
         // custom middlewares
         const verifyFBToken = async (req, res, next) => {
@@ -73,7 +74,6 @@ async function run() {
                 return res.status(403).send({ message: 'forbidden access' })
             }
         }
-
         const verifyAdmin = async (req, res, next) => {
             const email = req.decoded.email;
             const query = { email }
@@ -83,6 +83,869 @@ async function run() {
             }
             next();
         }
+        const verifyRider = async (req, res, next) => {
+            const email = req.decoded.email;
+            const query = { email }
+            const user = await usersCollection.findOne(query);
+            if (!user || user.role !== 'rider') {
+                return res.status(403).send({ message: 'forbidden access' })
+            }
+            next();
+        }
+
+        // Tracking event helper
+        const createTrackingEvent = async ({
+            parcel,
+            status,
+            title,
+            description,
+            actorRole = "system",
+        }) => {
+            await trackingCollection.insertOne({
+                parcelId: parcel._id,
+                trackingId: parcel.trackingId,
+                status,
+                title,
+                description,
+                actorRole,
+                createdAt: new Date(),
+                isPublic: true,
+            });
+        };
+
+        // Public parcel tracking API
+        app.get("/tracking/:trackingId", async (req, res) => {
+            try {
+                const { trackingId } = req.params;
+
+                const parcel = await parcelsCollection.findOne(
+                    { trackingId },
+                    {
+                        projection: {
+                            trackingId: 1,
+                            parcelTitle: 1,
+                            parcelType: 1,
+                            senderRegion: 1,
+                            receiverRegion: 1,
+                            senderServiceCenter: 1,
+                            receiverServiceCenter: 1,
+                            status: 1,
+                            paymentStatus: 1,
+                            delivery_status: 1,
+                            submittedAt: 1,
+                            paidAt: 1,
+                            assignedAt: 1,
+                            pickedUpAt: 1,
+                            deliveredAt: 1,
+                        },
+                    }
+                );
+
+                if (!parcel) {
+                    return res.status(404).send({
+                        success: false,
+                        message: "Parcel not found",
+                    });
+                }
+
+                const trackingHistory = await trackingCollection
+                    .find({ trackingId, isPublic: true })
+                    .sort({ createdAt: 1 })
+                    .toArray();
+
+                res.send({
+                    success: true,
+                    parcel,
+                    trackingHistory,
+                });
+            } catch (error) {
+                console.error(error);
+                res.status(500).send({
+                    success: false,
+                    message: "Failed to track parcel",
+                });
+            }
+        });
+
+        //
+        const calculateRiderEarning = (parcel) => {
+            const senderDistrict = String(
+                parcel.senderDistrict || parcel.senderRegion || ""
+            ).trim().toLowerCase();
+
+            const receiverDistrict = String(
+                parcel.receiverDistrict || parcel.receiverRegion || ""
+            ).trim().toLowerCase();
+
+            const fee = Number(parcel.deliveryCost) || 0;
+
+            const sameDistrict =
+                senderDistrict !== "" &&
+                receiverDistrict !== "" &&
+                senderDistrict === receiverDistrict;
+
+            const percentage = sameDistrict ? 80 : 30;
+
+            return {
+                deliveryFee: fee,
+                earningPercentage: percentage,
+                riderEarning: Number(
+                    (fee * percentage / 100).toFixed(2)
+                ),
+                routeType: sameDistrict ? "same-district" : "different-district",
+            };
+        };
+
+        //
+        app.get("/rider/earnings-summary", verifyFBToken, async (req, res) => {
+            try {
+                const riderEmail = req.decoded.email;
+
+                if (!riderEmail) {
+                    return res.status(401).send({ message: "Unauthorized" });
+                }
+
+                // 1. Verify active rider
+                const rider = await riderApplicationsCollection.findOne({
+                    email: riderEmail,
+                    status: "active",
+                });
+
+                if (!rider) {
+                    return res.status(403).send({
+                        message: "Only active riders can access earnings.",
+                    });
+                }
+
+                // 2. Fetch this rider's completed deliveries
+                const parcels = await parcelsCollection
+                    .find({
+                        assignedRiderEmail: riderEmail,
+                        delivery_status: {
+                            $in: ["delivered", "service center delivered"],
+                        },
+                    })
+                    .toArray();
+
+                // 3. Fetch this rider's cashout records
+                const allCashouts = await cashoutsCollection
+                    .find({ riderEmail })
+                    .sort({ requestedAt: -1 })
+                    .toArray();
+
+                // Use the same earning calculation as Completed Deliveries
+                const getEarning = (parcel) => {
+                    const result = calculateRiderEarning(parcel);
+                    return Number(result.riderEarning) || 0;
+                };
+
+                // Match cashouts only to completed parcels belonging to this rider.
+                // This excludes unrelated dummy records and prevents cashouts
+                // for nonexistent/uncompleted parcels from inflating totals.
+                const parcelMap = new Map(
+                    parcels.map((parcel) => [String(parcel._id), parcel])
+                );
+
+                // Keep only the newest cashout record per parcel.
+                const latestCashoutByParcel = new Map();
+
+                for (const cashout of allCashouts) {
+                    const parcelId = String(cashout.parcelId);
+
+                    if (
+                        parcelMap.has(parcelId) &&
+                        !latestCashoutByParcel.has(parcelId)
+                    ) {
+                        latestCashoutByParcel.set(parcelId, cashout);
+                    }
+                }
+
+                // 4. Calculate totals parcel by parcel
+                let totalEarnings = 0;
+                let totalCashout = 0;
+                let requestedCashout = 0;
+                let availableEarnings = 0;
+
+                const completedWithEarnings = parcels.map((parcel) => {
+                    const earning = getEarning(parcel);
+                    const cashout = latestCashoutByParcel.get(String(parcel._id));
+
+                    totalEarnings += earning;
+
+                    if (cashout?.status === "paid") {
+                        totalCashout += Number(cashout.amount) || 0;
+                    } else if (cashout?.status === "requested") {
+                        requestedCashout += Number(cashout.amount) || 0;
+                    } else {
+                        availableEarnings += earning;
+                    }
+
+                    return {
+                        parcel,
+                        earning,
+                        date: new Date(
+                            parcel.deliveredAt || parcel.updatedAt || parcel.assignedAt
+                        ),
+                    };
+                });
+
+                totalEarnings = Number(totalEarnings.toFixed(2));
+                totalCashout = Number(totalCashout.toFixed(2));
+                requestedCashout = Number(requestedCashout.toFixed(2));
+                availableEarnings = Number(availableEarnings.toFixed(2));
+
+                // Pending = available + requested; excludes money already paid.
+                const pendingEarnings = Number(
+                    (availableEarnings + requestedCashout).toFixed(2)
+                );
+
+                const averagePerDelivery = parcels.length
+                    ? Number((totalEarnings / parcels.length).toFixed(2))
+                    : 0;
+
+                // 5. Date helpers using Bangladesh local time
+                const dateKey = (date) =>
+                    new Intl.DateTimeFormat("en-CA", {
+                        timeZone: "Asia/Dhaka",
+                        year: "numeric",
+                        month: "2-digit",
+                        day: "2-digit",
+                    }).format(date);
+
+                const monthKey = (date) =>
+                    new Intl.DateTimeFormat("en-CA", {
+                        timeZone: "Asia/Dhaka",
+                        year: "numeric",
+                        month: "2-digit",
+                    }).format(date);
+
+                const parts = new Intl.DateTimeFormat("en-GB", {
+                    timeZone: "Asia/Dhaka",
+                    year: "numeric",
+                    month: "2-digit",
+                    day: "2-digit",
+                }).formatToParts(new Date());
+
+                const dateParts = Object.fromEntries(
+                    parts
+                        .filter((part) => part.type !== "literal")
+                        .map((part) => [part.type, part.value])
+                );
+
+                const todayKey = dateKey(new Date());
+                const todayStart = new Date(`${todayKey}T00:00:00+06:00`);
+                const tomorrowStart = new Date(
+                    todayStart.getTime() + 86400000
+                );
+
+                const todayWeekday = new Date(
+                    `${todayKey}T12:00:00+06:00`
+                ).getUTCDay();
+
+                const daysSinceMonday = (todayWeekday + 6) % 7;
+
+                const weekStart = new Date(
+                    todayStart.getTime() - daysSinceMonday * 86400000
+                );
+
+                const monthStart = new Date(
+                    `${dateParts.year}-${dateParts.month}-01T00:00:00+06:00`
+                );
+
+                const yearStart = new Date(
+                    `${dateParts.year}-01-01T00:00:00+06:00`
+                );
+
+                const validDeliveries = completedWithEarnings.filter(
+                    (item) => !Number.isNaN(item.date.getTime())
+                );
+
+                const sumBetween = (start, end) =>
+                    Number(
+                        validDeliveries
+                            .filter(
+                                ({ date }) => date >= start && date < end
+                            )
+                            .reduce((sum, item) => sum + item.earning, 0)
+                            .toFixed(2)
+                    );
+
+                const totalsByPeriod = {
+                    today: sumBetween(todayStart, tomorrowStart),
+                    week: sumBetween(weekStart, tomorrowStart),
+                    month: sumBetween(monthStart, tomorrowStart),
+                    year: sumBetween(yearStart, tomorrowStart),
+                    overall: totalEarnings,
+                };
+
+                // 6. Group earnings for chart
+                const dailyTotals = new Map();
+                const monthlyTotals = new Map();
+
+                validDeliveries.forEach(({ date, earning }) => {
+                    const day = dateKey(date);
+                    const month = monthKey(date);
+
+                    dailyTotals.set(
+                        day,
+                        (dailyTotals.get(day) || 0) + earning
+                    );
+
+                    monthlyTotals.set(
+                        month,
+                        (monthlyTotals.get(month) || 0) + earning
+                    );
+                });
+
+                const amount = (value) =>
+                    Number((value || 0).toFixed(2));
+
+                const analysis = {
+                    today: [
+                        {
+                            label: "Today",
+                            amount: totalsByPeriod.today,
+                        },
+                    ],
+
+                    week: Array.from({ length: 7 }, (_, index) => {
+                        const date = new Date(
+                            weekStart.getTime() + index * 86400000
+                        );
+
+                        return {
+                            label: new Intl.DateTimeFormat("en-US", {
+                                timeZone: "Asia/Dhaka",
+                                weekday: "short",
+                            }).format(date),
+                            amount: amount(dailyTotals.get(dateKey(date))),
+                        };
+                    }),
+
+                    month: Array.from(
+                        { length: Number(dateParts.day) },
+                        (_, index) => {
+                            const date = new Date(
+                                monthStart.getTime() + index * 86400000
+                            );
+
+                            return {
+                                label: String(index + 1),
+                                amount: amount(dailyTotals.get(dateKey(date))),
+                            };
+                        }
+                    ),
+
+                    year: Array.from({ length: 12 }, (_, index) => {
+                        const key = `${dateParts.year}-${String(index + 1).padStart(2, "0")}`;
+
+                        return {
+                            label: new Intl.DateTimeFormat("en-US", {
+                                month: "short",
+                                timeZone: "Asia/Dhaka",
+                            }).format(new Date(`${key}-01T12:00:00+06:00`)),
+                            amount: amount(monthlyTotals.get(key)),
+                        };
+                    }),
+
+                    overall: [...monthlyTotals.entries()]
+                        .sort(([a], [b]) => a.localeCompare(b))
+                        .map(([key, value]) => ({
+                            label: key,
+                            amount: amount(value),
+                        })),
+                };
+
+                console.log("Rider earnings summary:", {
+                    riderEmail,
+                    completedDeliveries: parcels.length,
+                    matchedCashouts: latestCashoutByParcel.size,
+                    totalEarnings,
+                    totalCashout,
+                    requestedCashout,
+                    pendingEarnings,
+                    availableEarnings,
+                });
+
+                return res.send({
+                    summary: {
+                        totalEarnings,
+                        totalCashout,
+                        pendingEarnings,
+                        requestedCashout,
+                        availableEarnings,
+                        completedDeliveries: parcels.length,
+                        averagePerDelivery,
+                    },
+                    totalsByPeriod,
+                    analysis,
+                });
+            } catch (error) {
+                console.error("Rider earnings summary error:", error);
+
+                return res.status(500).send({
+                    message: "Failed to load earnings summary.",
+                });
+            }
+        });
+
+        app.get("/rider/completed-deliveries", verifyFBToken, async (req, res) => {
+            try {
+                const riderEmail = req.decoded.email;
+
+                // Confirm that the authenticated user is an active rider.
+                const rider = await riderApplicationsCollection.findOne({
+                    email: riderEmail,
+                    status: "active",
+                });
+
+                if (!rider) {
+                    return res.status(403).send({
+                        message: "Only active riders can access this resource.",
+                    });
+                }
+
+                const parcels = await parcelsCollection
+                    .find({
+                        assignedRiderEmail: riderEmail,
+                        delivery_status: {
+                            $in: [
+                                "delivered",
+                                "service center delivered",
+                            ],
+                        },
+                    })
+                    .sort({ deliveredAt: -1, updatedAt: -1 })
+                    .toArray();
+
+                const result = parcels.map((parcel) => {
+                    const earning = calculateRiderEarning(parcel);
+
+                    return {
+                        ...parcel,
+                        ...earning,
+                        cashoutStatus: parcel.cashoutStatus || "available",
+                    };
+                });
+
+                res.send(result);
+            } catch (error) {
+                console.error("Completed deliveries error:", error);
+
+                res.status(500).send({
+                    message: "Failed to fetch completed deliveries.",
+                });
+            }
+        }
+        );
+
+        app.post("/rider/cashout/:parcelId", verifyFBToken, async (req, res) => {
+            try {
+                const { parcelId } = req.params;
+                const riderEmail = req.decoded.email;
+
+                if (!riderEmail) {
+                    return res.status(401).send({
+                        message: "Unauthorized.",
+                    });
+                }
+
+                if (!ObjectId.isValid(parcelId)) {
+                    return res.status(400).send({
+                        message: "Invalid parcel ID.",
+                    });
+                }
+
+                // 1. Verify active rider
+                const rider = await riderApplicationsCollection.findOne({
+                    email: riderEmail,
+                    status: "active",
+                });
+
+                if (!rider) {
+                    return res.status(403).send({
+                        message: "Only active riders can request cash out.",
+                    });
+                }
+
+                const parcelObjectId = new ObjectId(parcelId);
+
+                // 2. Verify this parcel belongs to this rider and is completed
+                const parcel = await parcelsCollection.findOne({
+                    _id: parcelObjectId,
+                    assignedRiderEmail: riderEmail,
+                    delivery_status: {
+                        $in: ["delivered", "service center delivered"],
+                    },
+                });
+
+                if (!parcel) {
+                    return res.status(404).send({
+                        message: "Completed parcel not found for this rider.",
+                    });
+                }
+
+                // 3. Check parcel cashout status
+                const currentStatus = String(
+                    parcel.cashoutStatus || "available"
+                ).toLowerCase();
+
+                if (["requested", "paid"].includes(currentStatus)) {
+                    return res.status(409).send({
+                        message: "Cash-out has already been requested for this parcel.",
+                    });
+                }
+
+                // 4. Check existing cashout record as an extra safeguard
+                const existingCashout = await cashoutsCollection.findOne({
+                    parcelId: parcelObjectId,
+                    riderEmail,
+                    status: { $in: ["requested", "paid"] },
+                });
+
+                if (existingCashout) {
+                    return res.status(409).send({
+                        message: "A cash-out record already exists for this parcel.",
+                    });
+                }
+
+                // 5. Calculate earning on the server
+                const earning = calculateRiderEarning(parcel);
+                const earningAmount = Number(earning.riderEarning);
+
+                if (!Number.isFinite(earningAmount) || earningAmount <= 0) {
+                    return res.status(400).send({
+                        message: "No payable earning is available for this parcel.",
+                    });
+                }
+
+                const now = new Date().toISOString();
+
+                // 6. Atomically claim the parcel for cash out
+                const claim = await parcelsCollection.updateOne(
+                    {
+                        _id: parcelObjectId,
+                        assignedRiderEmail: riderEmail,
+                        delivery_status: {
+                            $in: ["delivered", "service center delivered"],
+                        },
+                        cashoutStatus: {
+                            $nin: ["requested", "paid"],
+                        },
+                    },
+                    {
+                        $set: {
+                            cashoutStatus: "requested",
+                            cashoutRequestedAt: now,
+                            riderEarning: earningAmount,
+                            earningPercentage: earning.earningPercentage,
+                            earningRouteType: earning.routeType,
+                        },
+                    }
+                );
+
+                if (claim.modifiedCount !== 1) {
+                    return res.status(409).send({
+                        message: "Cash-out already requested. Please refresh.",
+                    });
+                }
+
+                // 7. Create cashout record
+                const cashout = {
+                    parcelId: parcelObjectId,
+                    trackingId: parcel.trackingId || "",
+                    riderEmail,
+                    riderName: rider.name || "",
+                    deliveryFee: earning.deliveryFee,
+                    earningPercentage: earning.earningPercentage,
+                    amount: earningAmount,
+                    routeType: earning.routeType,
+                    status: "requested",
+                    requestedAt: now,
+                    reviewedAt: null,
+                    reviewedBy: null,
+                    paidAt: null,
+                };
+
+                try {
+                    const inserted = await cashoutsCollection.insertOne(cashout);
+
+                    return res.status(201).send({
+                        success: true,
+                        message: "Cash-out request submitted successfully.",
+                        cashoutId: inserted.insertedId,
+                        amount: earningAmount,
+                        status: "requested",
+                    });
+                } catch (insertError) {
+                    // Roll back parcel claim if cashout insert fails
+                    await parcelsCollection.updateOne(
+                        {
+                            _id: parcelObjectId,
+                            assignedRiderEmail: riderEmail,
+                            cashoutStatus: "requested",
+                            cashoutRequestedAt: now,
+                        },
+                        {
+                            $set: {
+                                cashoutStatus: "available",
+                            },
+                            $unset: {
+                                cashoutRequestedAt: "",
+                                riderEarning: "",
+                                earningPercentage: "",
+                                earningRouteType: "",
+                            },
+                        }
+                    );
+
+                    throw insertError;
+                }
+            } catch (error) {
+                console.error("Cash-out request error:", error);
+
+                return res.status(500).send({
+                    message: "Failed to create cash-out request.",
+                });
+            }
+        });
+
+        app.patch("/admin/cashouts/:cashoutId/approve", verifyFBToken, verifyAdmin, async (req, res) => {
+            try {
+                const { cashoutId } = req.params;
+
+                if (!ObjectId.isValid(cashoutId)) {
+                    return res.status(400).send({
+                        message: "Invalid cash-out ID.",
+                    });
+                }
+
+                const cashoutObjectId = new ObjectId(cashoutId);
+                const now = new Date().toISOString();
+
+                const cashout = await cashoutsCollection.findOne({
+                    _id: cashoutObjectId,
+                    status: "requested",
+                });
+
+                if (!cashout) {
+                    return res.status(404).send({
+                        message: "Pending cash-out request not found.",
+                    });
+                }
+
+                const parcelUpdate = await parcelsCollection.updateOne(
+                    {
+                        _id: cashout.parcelId,
+                        assignedRiderEmail: cashout.riderEmail,
+                        cashoutStatus: "requested",
+                    },
+                    {
+                        $set: {
+                            cashoutStatus: "paid",
+                            cashoutPaidAt: now,
+                        },
+                    }
+                );
+
+                if (parcelUpdate.modifiedCount !== 1) {
+                    return res.status(409).send({
+                        message: "Parcel cash-out status has changed.",
+                    });
+                }
+
+                const cashoutUpdate = await cashoutsCollection.updateOne(
+                    {
+                        _id: cashoutObjectId,
+                        status: "requested",
+                    },
+                    {
+                        $set: {
+                            status: "paid",
+                            reviewedAt: now,
+                            reviewedBy: req.decoded.email,
+                            paidAt: now,
+                        },
+                    }
+                );
+
+                if (cashoutUpdate.modifiedCount !== 1) {
+                    // Compensate if another request changed the cashout record.
+                    await parcelsCollection.updateOne(
+                        {
+                            _id: cashout.parcelId,
+                            cashoutStatus: "paid",
+                            cashoutPaidAt: now,
+                        },
+                        {
+                            $set: {
+                                cashoutStatus: "requested",
+                            },
+                            $unset: {
+                                cashoutPaidAt: "",
+                            },
+                        }
+                    );
+
+                    return res.status(409).send({
+                        message: "Cash-out request has already been processed.",
+                    });
+                }
+
+                res.send({
+                    success: true,
+                    message: "Cash-out marked as paid.",
+                    amount: cashout.amount,
+                });
+            } catch (error) {
+                console.error("Cash-out approval error:", error);
+
+                res.status(500).send({
+                    message: "Failed to approve cash-out.",
+                });
+            }
+        }
+        );
+
+        //
+        app.get("/rider/delivery-tasks", verifyFBToken, verifyRider, async (req, res) => {
+            try {
+                const riderEmail = req.decoded.email;
+
+                const parcels = await parcelsCollection
+                    .find({
+                        assignedRiderEmail: riderEmail,
+                        delivery_status: {
+                            $in: ["assigned", "pending-pickup", "in-transit"],
+                        },
+                    })
+                    .sort({ assignedAt: -1 })
+                    .toArray();
+
+                res.send(parcels);
+            } catch (error) {
+                console.error(error);
+                res.status(500).send({
+                    message: "Failed to fetch delivery tasks.",
+                });
+            }
+        }
+        );
+        app.patch("/rider/delivery-tasks/:parcelId/status", verifyFBToken, verifyRider, async (req, res) => {
+            try {
+                const { parcelId } = req.params;
+                const { action } = req.body;
+                const riderEmail = req.decoded.email;
+
+                if (!ObjectId.isValid(parcelId)) {
+                    return res.status(400).send({
+                        message: "Invalid parcel ID.",
+                    });
+                }
+
+                if (!["picked-up", "delivered"].includes(action)) {
+                    return res.status(400).send({
+                        message: "Invalid delivery action.",
+                    });
+                }
+
+                const parcelObjectId = new ObjectId(parcelId);
+
+                const parcel = await parcelsCollection.findOne({
+                    _id: parcelObjectId,
+                    assignedRiderEmail: riderEmail,
+                });
+
+                if (!parcel) {
+                    return res.status(404).send({
+                        message: "Assigned parcel not found.",
+                    });
+                }
+
+                const currentStatus = (
+                    parcel.delivery_status || ""
+                ).toLowerCase();
+
+                let allowedStatuses;
+                let newStatus;
+                let newDeliveryStatus;
+
+                if (action === "picked-up") {
+                    allowedStatuses = ["assigned", "pending-pickup"];
+                    newStatus = "in transit";
+                    newDeliveryStatus = "in-transit";
+                } else {
+                    allowedStatuses = ["in-transit"];
+                    newStatus = "delivered";
+                    newDeliveryStatus = "delivered";
+                }
+
+                if (!allowedStatuses.includes(currentStatus)) {
+                    return res.status(409).send({
+                        message:
+                            action === "picked-up"
+                                ? "This parcel cannot be picked up in its current status."
+                                : "Only in-transit parcels can be marked as delivered.",
+                    });
+                }
+
+                const now = new Date().toISOString();
+
+                const updateFields = {
+                    status: newStatus,
+                    delivery_status: newDeliveryStatus,
+                    updatedAt: now,
+                };
+
+                if (action === "picked-up") {
+                    updateFields.pickedUpAt = now;
+                } else {
+                    updateFields.deliveredAt = now;
+                }
+
+                const result = await parcelsCollection.updateOne(
+                    {
+                        _id: parcelObjectId,
+                        assignedRiderEmail: riderEmail,
+                        delivery_status: parcel.delivery_status,
+                    },
+                    {
+                        $set: updateFields,
+                        $push: {
+                            trackingHistory: {
+                                status: newDeliveryStatus,
+                                updatedAt: now,
+                                updatedBy: riderEmail,
+                            },
+                        },
+                    }
+                );
+
+                if (result.modifiedCount !== 1) {
+                    return res.status(409).send({
+                        message:
+                            "Parcel status changed. Refresh and try again.",
+                    });
+                }
+
+                res.send({
+                    success: true,
+                    message:
+                        action === "picked-up"
+                            ? "Parcel marked as picked up."
+                            : "Parcel marked as delivered.",
+                    status: newStatus,
+                    delivery_status: newDeliveryStatus,
+                });
+            } catch (error) {
+                console.error("Update delivery status error:", error);
+
+                res.status(500).send({
+                    message: "Failed to update delivery status.",
+                });
+            }
+        }
+        );
 
         // assign riders
         app.get(
@@ -109,7 +972,6 @@ async function run() {
                 }
             }
         );
-
         app.get(
             "/riders/available",
             verifyFBToken,
@@ -162,141 +1024,112 @@ async function run() {
                 }
             }
         );
+        app.patch("/parcels/:parcelId/assign-rider", verifyFBToken, verifyAdmin, async (req, res) => {
+            try {
+                const { parcelId } = req.params;
+                const { riderId } = req.body;
 
-        app.patch(
-            "/parcels/:parcelId/assign-rider",
-            verifyFBToken,
-            verifyAdmin,
-            async (req, res) => {
-                try {
-                    const { parcelId } = req.params;
-                    const { riderId } = req.body;
+                if (
+                    !ObjectId.isValid(parcelId) ||
+                    !ObjectId.isValid(riderId)
+                ) {
+                    return res.status(400).send({
+                        message: "Invalid parcel or rider ID.",
+                    });
+                }
 
-                    if (
-                        !ObjectId.isValid(parcelId) ||
-                        !ObjectId.isValid(riderId)
-                    ) {
-                        return res.status(400).send({
-                            message: "Invalid parcel or rider ID.",
-                        });
-                    }
+                const parcelObjectId = new ObjectId(parcelId);
+                const riderObjectId = new ObjectId(riderId);
 
-                    const parcelObjectId = new ObjectId(parcelId);
-                    const riderObjectId = new ObjectId(riderId);
+                // Find parcel
+                const parcel = await parcelsCollection.findOne({
+                    _id: parcelObjectId,
+                });
 
-                    // Find parcel
-                    const parcel = await parcelsCollection.findOne({
+                if (!parcel) {
+                    return res.status(404).send({
+                        message: "Parcel not found.",
+                    });
+                }
+
+                if (
+                    parcel.status !== "pending" ||
+                    parcel.paymentStatus !== "paid"
+                ) {
+                    return res.status(400).send({
+                        message: "This parcel cannot be assigned.",
+                    });
+                }
+
+                // Find active rider
+                const rider = await riderApplicationsCollection.findOne({
+                    _id: riderObjectId,
+                    status: "active",
+                });
+
+                if (!rider) {
+                    return res.status(404).send({
+                        message: "Active rider not found.",
+                    });
+                }
+
+                if (rider.workStatus === "in delivery") {
+                    return res.status(409).send({
+                        message: "This rider is already delivering a parcel.",
+                    });
+                }
+
+                // Match rider district with parcel service center
+                if (
+                    rider.district?.trim().toLowerCase() !==
+                    parcel.receiverServiceCenter?.trim().toLowerCase()
+                ) {
+                    return res.status(400).send({
+                        message: "Rider district does not match the parcel service center.",
+                    });
+                }
+
+                // Update parcel
+                const parcelUpdate = await parcelsCollection.updateOne(
+                    {
                         _id: parcelObjectId,
+                        status: "pending",
+                        paymentStatus: "paid",
+                    },
+                    {
+                        $set: {
+                            delivery_status: "in-transit",
+                            assignedRiderId: riderObjectId,
+                            assignedRiderName: rider.name || "",
+                            assignedRiderEmail: rider.email,
+                            assignedAt: new Date().toISOString(),
+                        },
+                    }
+                );
+
+                if (parcelUpdate.modifiedCount !== 1) {
+                    return res.status(409).send({
+                        message: "Parcel was already assigned or its status changed.",
                     });
+                }
 
-                    if (!parcel) {
-                        return res.status(404).send({
-                            message: "Parcel not found.",
-                        });
-                    }
-
-                    if (
-                        parcel.status !== "pending" ||
-                        parcel.paymentStatus !== "paid"
-                    ) {
-                        return res.status(400).send({
-                            message: "This parcel cannot be assigned.",
-                        });
-                    }
-
-                    // Find active rider
-                    const rider = await riderApplicationsCollection.findOne({
-                        _id: riderObjectId,
-                        status: "active",
-                    });
-
-                    if (!rider) {
-                        return res.status(404).send({
-                            message: "Active rider not found.",
-                        });
-                    }
-
-                    if (rider.workStatus === "in delivery") {
-                        return res.status(409).send({
-                            message: "This rider is already delivering a parcel.",
-                        });
-                    }
-
-                    // Match rider district with parcel service center
-                    if (
-                        rider.district?.trim().toLowerCase() !==
-                        parcel.receiverServiceCenter?.trim().toLowerCase()
-                    ) {
-                        return res.status(400).send({
-                            message: "Rider district does not match the parcel service center.",
-                        });
-                    }
-
-                    // Update parcel
-                    const parcelUpdate = await parcelsCollection.updateOne(
+                // Update rider work status
+                try {
+                    const riderUpdate = await riderApplicationsCollection.updateOne(
                         {
-                            _id: parcelObjectId,
-                            status: "pending",
-                            paymentStatus: "paid",
+                            _id: riderObjectId,
+                            status: "active",
+                            workStatus: { $ne: "in delivery" },
                         },
                         {
                             $set: {
-                                delivery_status: "in-transit",
-                                assignedRiderId: riderObjectId,
-                                assignedRiderName: rider.name || "",
-                                assignedRiderEmail: rider.email,
-                                assignedAt: new Date().toISOString(),
+                                workStatus: "in delivery",
                             },
                         }
                     );
 
-                    if (parcelUpdate.modifiedCount !== 1) {
-                        return res.status(409).send({
-                            message: "Parcel was already assigned or its status changed.",
-                        });
-                    }
-
-                    // Update rider work status
-                    try {
-                        const riderUpdate = await riderApplicationsCollection.updateOne(
-                            {
-                                _id: riderObjectId,
-                                status: "active",
-                                workStatus: { $ne: "in delivery" },
-                            },
-                            {
-                                $set: {
-                                    workStatus: "in delivery",
-                                },
-                            }
-                        );
-
-                        if (riderUpdate.modifiedCount !== 1) {
-                            // Roll back parcel assignment if rider update fails
-                            await parcelsCollection.updateOne(
-                                {
-                                    _id: parcelObjectId,
-                                    assignedRiderId: riderObjectId,
-                                },
-                                {
-                                    $set: {
-                                        delivery_status: parcel.delivery_status || "pending",
-                                    },
-                                    $unset: {
-                                        assignedRiderId: "",
-                                        assignedRiderName: "",
-                                        assignedRiderEmail: "",
-                                        assignedAt: "",
-                                    },
-                                }
-                            );
-
-                            return res.status(409).send({
-                                message: "Rider is no longer available. Please select another rider.",
-                            });
-                        }
-                    } catch (error) {
-                        // Roll back parcel assignment if rider update throws
+                    if (riderUpdate.modifiedCount !== 1) {
+                        // Roll back parcel assignment if rider update fails
                         await parcelsCollection.updateOne(
                             {
                                 _id: parcelObjectId,
@@ -315,25 +1148,49 @@ async function run() {
                             }
                         );
 
-                        throw error;
+                        return res.status(409).send({
+                            message: "Rider is no longer available. Please select another rider.",
+                        });
                     }
-
-                    res.send({
-                        success: true,
-                        message: "Rider assigned successfully.",
-                        parcelId,
-                        riderId,
-                        delivery_status: "in-transit",
-                        workStatus: "in delivery",
-                    });
                 } catch (error) {
-                    console.error("Assign rider error:", error);
+                    // Roll back parcel assignment if rider update throws
+                    await parcelsCollection.updateOne(
+                        {
+                            _id: parcelObjectId,
+                            assignedRiderId: riderObjectId,
+                        },
+                        {
+                            $set: {
+                                delivery_status: parcel.delivery_status || "pending",
+                            },
+                            $unset: {
+                                assignedRiderId: "",
+                                assignedRiderName: "",
+                                assignedRiderEmail: "",
+                                assignedAt: "",
+                            },
+                        }
+                    );
 
-                    res.status(500).send({
-                        message: "Failed to assign rider.",
-                    });
+                    throw error;
                 }
+
+                res.send({
+                    success: true,
+                    message: "Rider assigned successfully.",
+                    parcelId,
+                    riderId,
+                    delivery_status: "in-transit",
+                    workStatus: "in delivery",
+                });
+            } catch (error) {
+                console.error("Assign rider error:", error);
+
+                res.status(500).send({
+                    message: "Failed to assign rider.",
+                });
             }
+        }
         );
 
         // user role api
@@ -374,7 +1231,6 @@ async function run() {
                 });
             }
         });
-
         // for admin
         app.get("/users/search", async (req, res) => {
             try {
@@ -406,7 +1262,6 @@ async function run() {
                 res.status(500).send({ message: "Failed to search users." });
             }
         });
-
         app.patch("/users/:id/role", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
@@ -544,7 +1399,6 @@ async function run() {
                 });
             }
         });
-
         // GET: Pending Rider Applications
         app.get("/riderApplications/pending", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
@@ -561,7 +1415,6 @@ async function run() {
                 });
             }
         });
-
         app.get("/riderApplications", verifyFBToken, async (req, res) => {
             try {
                 const { status } = req.query;
@@ -587,7 +1440,6 @@ async function run() {
             }
         }
         );
-
         app.patch("/riderApplications/:id/status", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
