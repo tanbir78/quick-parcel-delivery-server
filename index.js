@@ -1196,82 +1196,74 @@ async function run() {
 
         );
 
-        app.get(
-            "/parcels/assign-rider",
-            verifyFBToken,
-            verifyAdmin,
-            async (req, res) => {
-                try {
-                    const parcels = await parcelsCollection
-                        .find({
-                            status: "pending",
-                            paymentStatus: "paid",
-                        })
-                        .sort({ creation_date: -1 })
-                        .toArray();
+        app.get("/parcels/assign-rider", verifyFBToken, verifyAdmin, async (req, res) => {
+            try {
+                const parcels = await parcelsCollection
+                    .find({
+                        status: "pending",
+                        paymentStatus: "paid",
+                    })
+                    .sort({ creation_date: -1 })
+                    .toArray();
 
-                    res.send(parcels);
-                } catch (error) {
-                    console.error("Error fetching parcels for rider assignment:", error);
+                res.send(parcels);
+            } catch (error) {
+                console.error("Error fetching parcels for rider assignment:", error);
 
-                    res.status(500).send({
-                        message: "Failed to fetch parcels for rider assignment.",
-                    });
-                }
+                res.status(500).send({
+                    message: "Failed to fetch parcels for rider assignment.",
+                });
             }
+        }
         );
 
-        app.get(
-            "/riders/available",
-            verifyFBToken,
-            verifyAdmin,
-            async (req, res) => {
-                try {
-                    const district = req.query.district?.trim();
+        app.get("/riders/available", verifyFBToken, verifyAdmin, async (req, res) => {
+            try {
+                const district = req.query.district?.trim();
 
-                    if (!district) {
-                        return res.status(400).send({
-                            message: "District is required.",
-                        });
-                    }
-
-                    const escapedDistrict = district.replace(
-                        /[.*+?^${}()|[\]\\]/g,
-                        "\\$&"
-                    );
-
-                    const riders = await riderApplicationsCollection
-                        .find(
-                            {
-                                district: {
-                                    $regex: `^${escapedDistrict}$`,
-                                    $options: "i",
-                                },
-                                status: "active",
-                            },
-                            {
-                                projection: {
-                                    name: 1,
-                                    email: 1,
-                                    phone: 1,
-                                    district: 1,
-                                    region: 1,
-                                    bikeBrand: 1,
-                                    bikeRegistrationNumber: 1,
-                                },
-                            }
-                        )
-                        .toArray();
-
-                    res.send(riders);
-                } catch (error) {
-                    console.error("Error fetching riders:", error);
-
-                    res.status(500).send({
-                        message: "Failed to fetch riders.",
+                if (!district) {
+                    return res.status(400).send({
+                        message: "District is required.",
                     });
                 }
+
+                const escapedDistrict = district.replace(
+                    /[.*+?^${}()|[\]\\]/g,
+                    "\\$&"
+                );
+
+                const riders = await riderApplicationsCollection
+                    .find(
+                        {
+                            district: {
+                                $regex: `^${escapedDistrict}$`,
+                                $options: "i",
+                            },
+                            status: "active",
+                        },
+                        {
+                            projection: {
+                                name: 1,
+                                email: 1,
+                                phone: 1,
+                                district: 1,
+                                region: 1,
+                                bikeBrand: 1,
+                                bikeRegistrationNumber: 1,
+                            },
+                        }
+                    )
+                    .toArray();
+
+                res.send(riders);
+            } catch (error) {
+                console.error("Error fetching riders:", error);
+
+                res.status(500).send({
+                    message: "Failed to fetch riders.",
+                });
             }
+        }
         );
 
         app.patch("/parcels/:parcelId/assign-rider", verifyFBToken, verifyAdmin, async (req, res) => {
@@ -1444,25 +1436,66 @@ async function run() {
         );
 
         // user role api
+        // app.get("/users/role", verifyFBToken, async (req, res) => {
+        //     try {
+        //         const email = req.query.email?.trim().toLowerCase();
+
+        //         if (!email) {
+        //             return res.status(400).send({
+        //                 message: "Email is required",
+        //             });
+        //         }
+
+        //         // Token email && requested email
+        //         if (req.decoded.email?.toLowerCase() !== email) {
+        //             return res.status(403).send({
+        //                 message: "Forbidden access",
+        //             });
+        //         }
+
+        //         const user = await usersCollection.findOne(
+        //             { email },
+        //             { projection: { role: 1, _id: 0 } }
+        //         );
+
+        //         if (!user) {
+        //             return res.status(404).send({
+        //                 message: "User not found",
+        //             });
+        //         }
+
+        //         res.send({ role: user.role || "user" });
+        //     } catch (error) {
+        //         console.error("Get user role error:", error);
+
+        //         res.status(500).send({
+        //             message: "Failed to get user role",
+        //         });
+        //     }
+        // });
+
         app.get("/users/role", verifyFBToken, async (req, res) => {
             try {
-                const email = req.query.email?.trim().toLowerCase();
+                const tokenEmail = req.decoded.email?.trim().toLowerCase();
+                const requestedEmail = req.query.email?.trim().toLowerCase();
 
-                if (!email) {
+                // console.log("Token email:", tokenEmail);
+                // console.log("Requested email:", requestedEmail);
+
+                if (!requestedEmail) {
                     return res.status(400).send({
                         message: "Email is required",
                     });
                 }
 
-                // Token email && requested email
-                if (req.decoded.email?.toLowerCase() !== email) {
+                if (tokenEmail !== requestedEmail) {
                     return res.status(403).send({
                         message: "Forbidden access",
                     });
                 }
 
                 const user = await usersCollection.findOne(
-                    { email },
+                    { email: requestedEmail },
                     { projection: { role: 1, _id: 0 } }
                 );
 
@@ -1472,11 +1505,11 @@ async function run() {
                     });
                 }
 
-                res.send({ role: user.role || "user" });
+                return res.send({ role: user.role || "user" });
             } catch (error) {
                 console.error("Get user role error:", error);
 
-                res.status(500).send({
+                return res.status(500).send({
                     message: "Failed to get user role",
                 });
             }
