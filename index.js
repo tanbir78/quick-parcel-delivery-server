@@ -1531,87 +1531,32 @@ async function run() {
         });
 
 
-        // Change another user's role
-        // Expected request body: { "email": "...", "role": "user" | "rider" | "admin" }
-        app.patch("/users/:id/role", verifyFBToken, verifyAdmin, async (req, res) => {
+        // Existing imports and middleware should already be configured.
+        const escapeRegex = (value) =>
+            value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+        app.get("/users/search", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
-                const { id } = req.params;
-                const { role: newRole } = req.body;
+                const q = (req.query.q || "").trim();
 
-                const targetUser = await usersCollection.findOne({
-                    _id: new ObjectId(id),
-                });
-
-                if (!targetUser) {
-                    return res.status(404).send({
-                        message: "User not found",
-                    });
-                }
-
-                const targetEmail = targetUser.email
-                    ?.trim()
-                    .toLowerCase();
-
-                // Protect the fixed Super Admin
-                if (targetEmail === FIXED_ADMIN_EMAIL) {
-                    return res.status(403).send({
-                        message: "Super Admin role cannot be modified",
-                    });
-                }
-
-                const allowedRoles = ["user", "rider", "admin"];
-
-                if (!allowedRoles.includes(newRole)) {
-                    return res.status(400).send({
-                        message: "Invalid role",
-                    });
-                }
-
-                const result = await usersCollection.updateOne(
-                    { _id: new ObjectId(id) },
-                    {
-                        $set: { role: newRole },
+                // Empty query means return all users.
+                const filter = q
+                    ? {
+                        $or: [
+                            { name: { $regex: escapeRegex(q), $options: "i" } },
+                            { displayName: { $regex: escapeRegex(q), $options: "i" } },
+                            { email: { $regex: escapeRegex(q), $options: "i" } },
+                            { phone: { $regex: escapeRegex(q), $options: "i" } },
+                            { phoneNumber: { $regex: escapeRegex(q), $options: "i" } },
+                            { role: { $regex: `^${escapeRegex(q)}$`, $options: "i" } }
+                        ]
                     }
-                );
-
-                return res.send({
-                    success: true,
-                    message: "User role updated successfully",
-                    modifiedCount: result.modifiedCount,
-                });
-            } catch (error) {
-                console.error("Update role error:", error);
-
-                return res.status(500).send({
-                    message: "Failed to update user role",
-                });
-            }
-        }
-        );
-
-        // for admin
-        app.get("/users/search", async (req, res) => {
-            try {
-                const email = req.query.email?.trim();
-
-                // if (!email || email.length < 3) {
-                //     return res.status(400).send({
-                //         message: "Enter at least 3 characters to search.",
-                //     });
-                // }
+                    : {};
 
                 const users = await usersCollection
-                    .find(
-                        { email: { $regex: email, $options: "i" } },
-                        {
-                            projection: {
-                                email: 1,
-                                created_at: 1,
-                                role: 1,
-                            },
-                        }
-                    )
-                    .limit(10)
+                    .find(filter)
+                    .sort({ created_at: -1 })
+                    .limit(200)
                     .toArray();
 
                 res.send(users);
@@ -1620,6 +1565,53 @@ async function run() {
                 res.status(500).send({ message: "Failed to search users." });
             }
         });
+
+        // Change another user's role
+        app.patch("/users/:id/role", verifyFBToken, verifyAdmin, async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { role } = req.body;
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid user ID." });
+                }
+
+                if (!["user", "admin"].includes(role)) {
+                    return res.status(400).send({ message: "Invalid role." });
+                }
+
+                const targetUser = await usersCollection.findOne({
+                    _id: new ObjectId(id)
+                });
+
+                if (!targetUser) {
+                    return res.status(404).send({ message: "User not found." });
+                }
+
+                const fixedAdminEmail = (
+                    process.env.ADMIN_EMAIL || "admin1@gamil.com"
+                ).trim().toLowerCase();
+
+                if (
+                    targetUser.email?.trim().toLowerCase() === fixedAdminEmail
+                ) {
+                    return res.status(403).send({
+                        message: "This admin's role cannot be changed."
+                    });
+                }
+
+                await usersCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { role } }
+                );
+
+                res.send({ success: true, message: "Role updated successfully." });
+            } catch (error) {
+                console.error("Role update error:", error);
+                res.status(500).send({ message: "Failed to update role." });
+            }
+        });
+
 
 
         app.post("/riderApplications", verifyFBToken, async (req, res) => {
